@@ -2,6 +2,8 @@
 
 #include <pcl/common/common.h>
 
+#include <cstring>
+
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
@@ -562,23 +564,42 @@ void Preprocess::default_handler(const sensor_msgs::msg::PointCloud2::UniquePtr 
   pl_corn.clear();
   pl_full.clear();
 
-  pcl::PointCloud<pcl::PointXYZI> pl_orig;
-  pcl::fromROSMsg(*msg, pl_orig);
-  int plsize = pl_orig.points.size();
+  // Webシミュ等、intensity/ringフィールドを持たないPointCloud2でも
+  // PCLのフィールド対応付け警告を出さずに読むため手動でフィールドを解決する。
+  int off_x = -1, off_y = -1, off_z = -1, off_i = -1;
+  for (const auto &f : msg->fields)
+  {
+    if (f.name == "x") off_x = static_cast<int>(f.offset);
+    else if (f.name == "y") off_y = static_cast<int>(f.offset);
+    else if (f.name == "z") off_z = static_cast<int>(f.offset);
+    else if (f.name == "intensity") off_i = static_cast<int>(f.offset);
+  }
+  if (off_x < 0 || off_y < 0 || off_z < 0)
+  {
+    RCLCPP_WARN(rclcpp::get_logger("preprocess"), "PointCloud2にx/y/zフィールドがありません");
+    return;
+  }
+
+  const size_t plsize = static_cast<size_t>(msg->width) * msg->height;
   if (plsize == 0)
     return;
   pl_surf.reserve(plsize);
 
-  for(uint i = 0; i < plsize; ++i)
+  const uint8_t *cloud_data = msg->data.data();
+  for (size_t i = 0; i < plsize; ++i)
   {
+    const uint8_t *p = cloud_data + i * msg->point_step;
     PointType added_pt;
     added_pt.normal_x = 0;
     added_pt.normal_y = 0;
     added_pt.normal_z = 0;
-    added_pt.x = pl_orig.points[i].x;
-    added_pt.y = pl_orig.points[i].y;
-    added_pt.z = pl_orig.points[i].z;
-    added_pt.intensity = pl_orig.points[i].intensity;
+    std::memcpy(&added_pt.x, p + off_x, sizeof(float));
+    std::memcpy(&added_pt.y, p + off_y, sizeof(float));
+    std::memcpy(&added_pt.z, p + off_z, sizeof(float));
+    if (off_i >= 0)
+      std::memcpy(&added_pt.intensity, p + off_i, sizeof(float));
+    else
+      added_pt.intensity = 0.0f;
     added_pt.curvature = 0.;
 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
