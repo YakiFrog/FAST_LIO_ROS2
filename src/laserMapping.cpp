@@ -62,6 +62,7 @@
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
 #include "wheel_odometry.hpp"
+#include "point_time.hpp"
 #include "scan_imu_sync.hpp"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -146,6 +147,7 @@ shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
 
 bool wheel_enabled = false, wheel_available = false;
+bool normalize_lidar_time = true;
 double wheel_max_age = 0.2;
 string wheel_topic, wheel_child_frame;
 fast_lio::WheelConfig wheel_config;
@@ -308,8 +310,16 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
 
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
+    double scan_origin_offset = 0.;
+    try {
+        if (normalize_lidar_time) scan_origin_offset = fast_lio::normalize_point_times(ptr->points);
+    } catch (const std::exception &error) {
+        RCLCPP_WARN(rclcpp::get_logger("laserMapping"), "Dropping invalid LiDAR timing: %s", error.what());
+        mtx_buffer.unlock();
+        return;
+    }
     lidar_buffer.push_back(ptr);
-    time_buffer.push_back(cur_time);
+    time_buffer.push_back(cur_time + scan_origin_offset);
     last_timestamp_lidar = cur_time;
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
     mtx_buffer.unlock();
@@ -638,7 +648,6 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
     {
@@ -650,6 +659,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    pubOdomAftMapped->publish(odomAftMapped);
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
@@ -840,6 +850,7 @@ public:
         this->declare_parameter<int>("preprocess.scan_line", 16);
         this->declare_parameter<int>("preprocess.timestamp_unit", US);
         this->declare_parameter<int>("preprocess.scan_rate", 10);
+        normalize_lidar_time = this->declare_parameter<bool>("preprocess.normalize_point_time", true);
         this->declare_parameter<int>("point_filter_num", 2);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
@@ -941,13 +952,14 @@ public:
 
         /*** debug record ***/
         // FILE *fp;
-        string pos_log_dir = root_dir + "/Log/pos_log.txt";
+        const string debug_dir = this->declare_parameter<string>("log_directory", root_dir + "/Log");
+        string pos_log_dir = debug_dir + "/pos_log.txt";
         fp = fopen(pos_log_dir.c_str(),"w");
 
         // ofstream fout_pre, fout_out, fout_dbg;
-        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
+        fout_pre.open(debug_dir + "/mat_pre.txt",ios::out);
+        fout_out.open(debug_dir + "/mat_out.txt",ios::out);
+        fout_dbg.open(debug_dir + "/dbg.txt",ios::out);
         if (fout_pre && fout_out)
             cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
         else

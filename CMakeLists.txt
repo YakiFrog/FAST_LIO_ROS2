@@ -127,6 +127,9 @@ install(
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(test_point_time test/test_point_time.cpp)
+  target_include_directories(test_point_time PRIVATE include)
+  add_test(NAME point_time COMMAND test_point_time)
   add_executable(test_wheel_odometry test/test_wheel_odometry.cpp)
   target_include_directories(test_wheel_odometry PRIVATE include)
   target_link_libraries(test_wheel_odometry Eigen3::Eigen OpenMP::OpenMP_CXX)

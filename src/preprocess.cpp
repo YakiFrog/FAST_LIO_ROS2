@@ -316,7 +316,9 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   std::vector<float> time_last(N_SCANS, 0.0);  // last offset time
   /*****************************************************************/
 
-  if (pl_orig.points[plsize - 1].time > 0)
+  if (std::any_of(pl_orig.points.begin(), pl_orig.points.end(), [](const auto &point) {
+        return std::isfinite(point.time) && std::abs(point.time) > 1e-9;
+      }))
   {
     given_offset_time = true;
   }
