@@ -125,4 +125,17 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  enable_testing()
+  add_executable(test_wheel_odometry test/test_wheel_odometry.cpp)
+  target_include_directories(test_wheel_odometry PRIVATE include)
+  target_link_libraries(test_wheel_odometry Eigen3::Eigen OpenMP::OpenMP_CXX)
+  add_test(NAME wheel_odometry COMMAND test_wheel_odometry)
+  add_executable(test_imu_processing test/test_imu_processing.cpp)
+  target_include_directories(test_imu_processing PRIVATE include ${PCL_INCLUDE_DIRS})
+  target_link_libraries(test_imu_processing ${PCL_LIBRARIES} Eigen3::Eigen OpenMP::OpenMP_CXX ${cpp_typesupport_target})
+  ament_target_dependencies(test_imu_processing ${dependencies})
+  add_test(NAME imu_processing COMMAND test_imu_processing)
+endif()
+
 ament_package()

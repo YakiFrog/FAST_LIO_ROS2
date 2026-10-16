@@ -61,6 +61,8 @@
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
 #include "preprocess.h"
+#include "wheel_odometry.hpp"
+#include "scan_imu_sync.hpp"
 #include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
@@ -142,6 +144,14 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+bool wheel_enabled = false, wheel_available = false;
+double wheel_max_age = 0.2;
+string wheel_topic, wheel_child_frame;
+fast_lio::WheelConfig wheel_config;
+fast_lio::WheelBuffer wheel_buffer;
+fast_lio::WheelSample wheel_sample;
+V3D wheel_gyro = V3D::Zero();
 
 void SigHandle(int sig)
 {
@@ -418,20 +428,17 @@ bool sync_packages(MeasureGroup &meas)
     }
 
     /*** push imu data, and pop from imu buffer ***/
-    double imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-    meas.imu.clear();
-    while ((!imu_buffer.empty()) && (imu_time < lidar_end_time))
-    {
-        imu_time = get_time_sec(imu_buffer.front()->header.stamp);
-        if(imu_time > lidar_end_time) break;
-        meas.imu.push_back(imu_buffer.front());
-        imu_buffer.pop_front();
-    }
+    fast_lio::collect_scan_imu(imu_buffer, lidar_end_time, meas.imu,
+        [](const sensor_msgs::msg::Imu::ConstSharedPtr &imu) {
+            return get_time_sec(imu->header.stamp);
+        });
 
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
-    return true;
+    // An empty interval must not reuse the last undistorted scan or re-register
+    // it at a new timestamp. Drop it if no IMU covers this scan.
+    return !meas.imu.empty();
 }
 
 int process_increments = 0;
@@ -744,7 +751,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
-    if (effct_feat_num < 1)
+    if (effct_feat_num < 1 && !wheel_available)
     {
         ekfom_data.valid = false;
         std::cerr << "No Effective Points!" << std::endl;
@@ -752,13 +759,14 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         return;
     }
 
-    res_mean_last = total_residual / effct_feat_num;
+    res_mean_last = effct_feat_num > 0 ? total_residual / effct_feat_num : 0.0;
     match_time  += omp_get_wtime() - match_start;
     double solve_start_  = omp_get_wtime();
     
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
-    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num, 12); //23
-    ekfom_data.h.resize(effct_feat_num);
+    const int wheel_rows = wheel_available ? 4 : 0;
+    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num + wheel_rows, wheel_available ? 23 : 12);
+    ekfom_data.h.resize(effct_feat_num + wheel_rows);
 
     for (int i = 0; i < effct_feat_num; i++)
     {
@@ -789,6 +797,13 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
+    }
+    if (wheel_available) {
+        const auto observation = fast_lio::wheel_observation(
+            s.rot.toRotationMatrix(), s.vel, s.bg, wheel_gyro,
+            wheel_sample, wheel_config, LASER_POINT_COV);
+        ekfom_data.h_x.bottomRows(4) = observation.jacobian;
+        ekfom_data.h.tail(4) = observation.residual;
     }
     solve_time += omp_get_wtime() - solve_start_;
 }
@@ -833,6 +848,27 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        wheel_enabled = this->declare_parameter<bool>("wheel.enabled", false);
+        wheel_topic = this->declare_parameter<string>("wheel.topic", "/odom");
+        wheel_child_frame = this->declare_parameter<string>("wheel.child_frame", "sirius3/base_footprint");
+        wheel_max_age = this->declare_parameter<double>("wheel.max_age", 0.2);
+        wheel_config.velocity_std = this->declare_parameter<double>("wheel.velocity_std", 0.05);
+        wheel_config.yaw_rate_std = this->declare_parameter<double>("wheel.yaw_rate_std", 0.05);
+        const auto wheel_t = this->declare_parameter<vector<double>>("wheel.imu_to_base_translation", {0.0, 0.0, 0.0});
+        const auto wheel_r = this->declare_parameter<vector<double>>("wheel.imu_from_base_rotation", {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0});
+        if (wheel_t.size() != 3 || wheel_r.size() != 9 || !std::isfinite(wheel_max_age) ||
+            !std::isfinite(wheel_config.velocity_std) || !std::isfinite(wheel_config.yaw_rate_std) || wheel_max_age <= 0.0 ||
+            wheel_config.velocity_std <= 0.0 || wheel_config.yaw_rate_std <= 0.0) {
+            throw std::invalid_argument("Invalid wheel odometry configuration");
+        }
+        wheel_config.imu_to_base = Eigen::Map<const Eigen::Vector3d>(wheel_t.data());
+        wheel_config.imu_from_base = Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(wheel_r.data());
+        if (!wheel_config.imu_to_base.allFinite() ||
+            !wheel_config.imu_from_base.allFinite() ||
+            !(wheel_config.imu_from_base.transpose() * wheel_config.imu_from_base).isApprox(M3D::Identity(), 1e-6) ||
+            std::abs(wheel_config.imu_from_base.determinant() - 1.0) > 1e-6) {
+            throw std::invalid_argument("Wheel extrinsic must be a finite rigid transform");
+        }
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -927,6 +963,32 @@ public:
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
         sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        if (wheel_enabled) {
+            if (this->get_node_topics_interface()->resolve_topic_name(wheel_topic) ==
+                this->get_node_topics_interface()->resolve_topic_name("/Odometry"))
+                throw std::invalid_argument("Wheel topic must not be FAST-LIO's /Odometry output");
+            sub_wheel_ = this->create_subscription<nav_msgs::msg::Odometry>(wheel_topic, 100,
+                [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+                    if (msg->child_frame_id != wheel_child_frame) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "Ignoring wheel odometry: expected child frame %s, got %s",
+                            wheel_child_frame.c_str(), msg->child_frame_id.c_str());
+                        return;
+                    }
+                    fast_lio::WheelSample sample;
+                    sample.stamp = get_time_sec(msg->header.stamp);
+                    const auto &twist = msg->twist.twist;
+                    sample.velocity << twist.linear.x, twist.linear.y, twist.linear.z;
+                    sample.yaw_rate = twist.angular.z;
+                    sample.variance << msg->twist.covariance[0], msg->twist.covariance[7],
+                        msg->twist.covariance[14], msg->twist.covariance[35];
+                    if (!wheel_buffer.push(sample))
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                            "Ignoring invalid/out-of-order wheel odometry");
+                });
+            RCLCPP_INFO(this->get_logger(), "Wheel fusion enabled: %s (child=%s)",
+                        wheel_topic.c_str(), wheel_child_frame.c_str());
+        }
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -1049,6 +1111,26 @@ private:
             /*** iterated state estimation ***/
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
+            wheel_available = wheel_enabled && !Measures.imu.empty() &&
+                wheel_buffer.at(lidar_end_time, wheel_max_age, wheel_sample);
+            if (wheel_available) {
+                const auto &gyro = Measures.imu.back()->angular_velocity;
+                wheel_gyro << gyro.x, gyro.y, gyro.z;
+                wheel_available = wheel_gyro.allFinite();
+            }
+            if (wheel_enabled) {
+                ++wheel_scan_count_;
+                if (wheel_available) ++wheel_used_count_;
+                if (wheel_available)
+                    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Wheel fusion active: vx=%.3f m/s, wz=%.3f rad/s, age=%.3f s, used=%zu/%zu scans",
+                        wheel_sample.velocity.x(), wheel_sample.yaw_rate,
+                        std::abs(lidar_end_time - wheel_sample.stamp),
+                        wheel_used_count_, wheel_scan_count_);
+                else
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                        "Wheel fusion inactive: no fresh wheel/IMU data for scan");
+            }
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
@@ -1136,6 +1218,7 @@ private:
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_wheel_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
@@ -1145,6 +1228,7 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;
+    size_t wheel_scan_count_ = 0, wheel_used_count_ = 0;
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;

@@ -341,6 +341,9 @@ void ImuProcess::Process(const MeasureGroup &meas,  esekfom::esekf<state_ikfom, 
   double t1,t2,t3;
   t1 = omp_get_wtime();
 
+  // A failed/initializing propagation produces no cloud. Never leave the
+  // previous scan available to the mapper under the current scan's timestamp.
+  cur_pcl_un_->clear();
   if(meas.imu.empty()) {return;};
   assert(meas.lidar != nullptr);
 
