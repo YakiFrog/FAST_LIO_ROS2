@@ -64,6 +64,9 @@
 #include "wheel_odometry.hpp"
 #include "point_time.hpp"
 #include "scan_imu_sync.hpp"
+#include "pipeline_diagnostics.hpp"
+#include <std_msgs/msg/string.hpp>
+fast_lio::PipelineDiagnostics pipeline_diagnostics;
 #include <ikd-Tree/ikd_Tree.h>
 
 #define INIT_TIME           (0.1)
@@ -294,6 +297,8 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg) 
 {
+    const auto diagnostic_receipt = fast_lio::PipelineDiagnostics::Clock::now();
+    pipeline_diagnostics.count("lidar_received");
     mtx_buffer.lock();
     scan_count ++;
     double cur_time = get_time_sec(msg->header.stamp);
@@ -302,6 +307,9 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        time_buffer.clear();
+        pipeline_diagnostics.reset_queue();
+        lidar_pushed = false;
     }
     if (is_first_lidar)
     {
@@ -319,6 +327,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
         return;
     }
     lidar_buffer.push_back(ptr);
+    pipeline_diagnostics.enqueue(ptr.get(), diagnostic_receipt);
     time_buffer.push_back(cur_time + scan_origin_offset);
     last_timestamp_lidar = cur_time;
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
@@ -330,6 +339,8 @@ double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
 void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg) 
 {
+    const auto diagnostic_receipt = fast_lio::PipelineDiagnostics::Clock::now();
+    pipeline_diagnostics.count("lidar_received");
     mtx_buffer.lock();
     double cur_time = get_time_sec(msg->header.stamp);
     double preprocess_start_time = omp_get_wtime();
@@ -338,6 +349,9 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     {
         std::cerr << "lidar loop back, clear buffer" << std::endl;
         lidar_buffer.clear();
+        time_buffer.clear();
+        pipeline_diagnostics.reset_queue();
+        lidar_pushed = false;
     }
     if(is_first_lidar)
     {
@@ -360,6 +374,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     PointCloudXYZI::Ptr  ptr(new PointCloudXYZI());
     p_pre->process(msg, ptr);
     lidar_buffer.push_back(ptr);
+    pipeline_diagnostics.enqueue(ptr.get(), diagnostic_receipt);
     time_buffer.push_back(last_timestamp_lidar);
     
     s_plot11[scan_count] = omp_get_wtime() - preprocess_start_time;
@@ -382,6 +397,7 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     }
 
     double timestamp = get_time_sec(msg->header.stamp);
+    pipeline_diagnostics.imu(timestamp);
 
     mtx_buffer.lock();
 
@@ -402,7 +418,9 @@ double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
 {
+    pipeline_diagnostics.count("sync_attempts");
     if (lidar_buffer.empty() || imu_buffer.empty()) {
+        pipeline_diagnostics.count("sync_wait_empty");
         return false;
     }
 
@@ -434,6 +452,7 @@ bool sync_packages(MeasureGroup &meas)
 
     if (last_timestamp_imu < lidar_end_time)
     {
+        pipeline_diagnostics.count("sync_wait_imu");
         return false;
     }
 
@@ -443,11 +462,13 @@ bool sync_packages(MeasureGroup &meas)
             return get_time_sec(imu->header.stamp);
         });
 
+    pipeline_diagnostics.begin(meas.lidar.get(), lidar_end_time, meas.imu.size());
     lidar_buffer.pop_front();
     time_buffer.pop_front();
     lidar_pushed = false;
     // An empty interval must not reuse the last undistorted scan or re-register
     // it at a new timestamp. Drop it if no IMU covers this scan.
+    if (meas.imu.empty()) pipeline_diagnostics.finish("empty_imu");
     return !meas.imu.empty();
 }
 
@@ -1018,6 +1039,15 @@ public:
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        pipeline_diagnostics.enabled = this->declare_parameter<bool>("performance_diagnostics_enabled", false);
+        if (pipeline_diagnostics.enabled) {
+            diagnostics_pub_ = this->create_publisher<std_msgs::msg::String>("/fastlio/diagnostics", 10);
+            diagnostics_timer_ = this->create_wall_timer(std::chrono::seconds(1), [this]() {
+                std_msgs::msg::String msg;
+                msg.data = pipeline_diagnostics.json(this->get_clock()->now().seconds());
+                diagnostics_pub_->publish(msg);
+            });
+        }
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
@@ -1033,8 +1063,10 @@ private:
     {
         if(sync_packages(Measures))
         {
+            fast_lio::PipelineDiagnostics::Scope diagnostic_scan(pipeline_diagnostics);
             if (flg_first_scan)
             {
+                diagnostic_scan.outcome = "first_scan";
                 first_lidar_time = Measures.lidar_beg_time;
                 p_imu->first_lidar_time = first_lidar_time;
                 flg_first_scan = false;
@@ -1050,12 +1082,17 @@ private:
             svd_time   = 0;
             t0 = omp_get_wtime();
 
+            const bool diagnostic_initializing = p_imu->initializing();
+            const auto diagnostic_imu_start = fast_lio::PipelineDiagnostics::Clock::now();
             p_imu->Process(Measures, kf, feats_undistort);
+            pipeline_diagnostics.measure("imu_process_ms", fast_lio::PipelineDiagnostics::ms(
+                fast_lio::PipelineDiagnostics::Clock::now(), diagnostic_imu_start));
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
-            if (feats_undistort->empty() || (feats_undistort == NULL))
+            if (!feats_undistort || feats_undistort->empty())
             {
+                diagnostic_scan.outcome = diagnostic_initializing ? "imu_initialization" : "no_points";
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 return;
             }
@@ -1073,6 +1110,7 @@ private:
             /*** initialize the map kdtree ***/
             if(ikdtree.Root_Node == nullptr)
             {
+                diagnostic_scan.outcome = "map_initialization";
                 RCLCPP_INFO(this->get_logger(), "Initialize the map kdtree");
                 if(feats_down_size > 5)
                 {
@@ -1121,6 +1159,7 @@ private:
             t2 = omp_get_wtime();
             
             /*** iterated state estimation ***/
+            const auto diagnostic_ekf_start = fast_lio::PipelineDiagnostics::Clock::now();
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             wheel_available = wheel_enabled && !Measures.imu.empty() &&
@@ -1153,20 +1192,30 @@ private:
             geoQuat.w = state_point.rot.coeffs()[3];
 
             double t_update_end = omp_get_wtime();
+            pipeline_diagnostics.measure("ekf_ms", fast_lio::PipelineDiagnostics::ms(
+                fast_lio::PipelineDiagnostics::Clock::now(), diagnostic_ekf_start));
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            pipeline_diagnostics.odometry();
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
+            const auto diagnostic_map_start = fast_lio::PipelineDiagnostics::Clock::now();
             map_incremental();
+            pipeline_diagnostics.measure("map_update_ms", fast_lio::PipelineDiagnostics::ms(
+                fast_lio::PipelineDiagnostics::Clock::now(), diagnostic_map_start));
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
+            const auto diagnostic_publish_start = fast_lio::PipelineDiagnostics::Clock::now();
             if (path_en)                         publish_path(pubPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+            pipeline_diagnostics.measure("cloud_publish_ms", fast_lio::PipelineDiagnostics::ms(
+                fast_lio::PipelineDiagnostics::Clock::now(), diagnostic_publish_start));
+            diagnostic_scan.outcome = scan_pub_en ? "published" : "odometry_only";
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
@@ -1235,6 +1284,8 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr diagnostics_pub_;
+    rclcpp::TimerBase::SharedPtr diagnostics_timer_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;

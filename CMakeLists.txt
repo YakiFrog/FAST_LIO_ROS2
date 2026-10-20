@@ -127,6 +127,9 @@ install(
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(test_pipeline_diagnostics test/test_pipeline_diagnostics.cpp)
+  target_include_directories(test_pipeline_diagnostics PRIVATE include)
+  add_test(NAME pipeline_diagnostics COMMAND test_pipeline_diagnostics)
   add_executable(test_point_time test/test_point_time.cpp)
   target_include_directories(test_point_time PRIVATE include)
   add_test(NAME point_time COMMAND test_point_time)
