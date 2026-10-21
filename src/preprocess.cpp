@@ -1,4 +1,5 @@
 #include "preprocess.h"
+#include "ring_sampling.hpp"
 
 #include <pcl/common/common.h>
 
@@ -307,6 +308,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
   if (plsize == 0)
     return;
   pl_surf.reserve(plsize);
+  fast_lio::RingSampler ring_sampler(N_SCANS, point_filter_num);
 
   /*** These variables only works when no point timestamps given ***/
   double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity
@@ -422,6 +424,8 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
     {
       PointType added_pt;
       // cout<<"!!!!!!"<<i<<" "<<plsize<<endl;
+      const int ring = pl_orig.points[i].ring;
+      if (ring >= N_SCANS) continue;
 
       added_pt.normal_x = 0;
       added_pt.normal_y = 0;
@@ -466,7 +470,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::msg::PointCloud2::UniquePtr
         time_last[layer] = added_pt.curvature;
       }
 
-      if (i % point_filter_num == 0)
+      if (ring_sampler.keep(pl_orig.points[i].ring))
       {
         if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
         {

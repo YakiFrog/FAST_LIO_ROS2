@@ -65,6 +65,7 @@
 #include "point_time.hpp"
 #include "scan_imu_sync.hpp"
 #include "pipeline_diagnostics.hpp"
+#include "lidar_quality.hpp"
 #include <std_msgs/msg/string.hpp>
 fast_lio::PipelineDiagnostics pipeline_diagnostics;
 #include <ikd-Tree/ikd_Tree.h>
@@ -157,6 +158,7 @@ fast_lio::WheelConfig wheel_config;
 fast_lio::WheelBuffer wheel_buffer;
 fast_lio::WheelSample wheel_sample;
 V3D wheel_gyro = V3D::Zero();
+fast_lio::LidarQualityGuard lidar_quality;
 
 void SigHandle(int sig)
 {
@@ -628,7 +630,8 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
         RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                             &laserCloudWorld->points[i]);
     }
-    *pcl_wait_pub += *laserCloudWorld;
+    if (lidar_quality.allow_map_update()) *pcl_wait_pub += *laserCloudWorld;
+    pipeline_diagnostics.state("published_map_points", pcl_wait_pub->size());
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
@@ -782,7 +785,18 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
-    if (effct_feat_num < 1 && !wheel_available)
+    fast_lio::LidarQualityStats quality_stats;
+    quality_stats.input_points = feats_down_size;
+    quality_stats.matched_points = effct_feat_num;
+    quality_stats.mean_residual = effct_feat_num > 0 ? total_residual / effct_feat_num : 0.;
+    for (int i = 0; i < effct_feat_num; ++i) {
+        const auto &normal = corr_normvect->points[i];
+        const Eigen::Vector3d n(normal.x, normal.y, normal.z);
+        quality_stats.normal_information.noalias() += n * n.transpose();
+    }
+    lidar_quality.evaluate(quality_stats);
+    const int lidar_rows = lidar_quality.weight > 0 ? effct_feat_num : 0;
+    if (lidar_rows < 1 && !wheel_available)
     {
         ekfom_data.valid = false;
         std::cerr << "No Effective Points!" << std::endl;
@@ -796,10 +810,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     
     /*** Computation of Measuremnt Jacobian matrix H and measurents vector ***/
     const int wheel_rows = wheel_available ? 4 : 0;
-    ekfom_data.h_x = MatrixXd::Zero(effct_feat_num + wheel_rows, wheel_available ? 23 : 12);
-    ekfom_data.h.resize(effct_feat_num + wheel_rows);
+    ekfom_data.h_x = MatrixXd::Zero(lidar_rows + wheel_rows, wheel_available ? 23 : 12);
+    ekfom_data.h.resize(lidar_rows + wheel_rows);
 
-    for (int i = 0; i < effct_feat_num; i++)
+    for (int i = 0; i < lidar_rows; i++)
     {
         const PointType &laser_p  = laserCloudOri->points[i];
         V3D point_this_be(laser_p.x, laser_p.y, laser_p.z);
@@ -828,6 +842,12 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
+    }
+    // Scale only LiDAR information. Wheel measurement covariance is unchanged.
+    if (lidar_rows > 0 && lidar_quality.weight < 1.) {
+        const double scale = std::sqrt(lidar_quality.weight);
+        ekfom_data.h_x.topRows(lidar_rows) *= scale;
+        ekfom_data.h.head(lidar_rows) *= scale;
     }
     if (wheel_available) {
         const auto observation = fast_lio::wheel_observation(
@@ -884,6 +904,16 @@ public:
         wheel_topic = this->declare_parameter<string>("wheel.topic", "/odom");
         wheel_child_frame = this->declare_parameter<string>("wheel.child_frame", "sirius3/base_footprint");
         wheel_max_age = this->declare_parameter<double>("wheel.max_age", 0.2);
+        lidar_quality.config.enabled = this->declare_parameter<bool>("lidar_quality.enabled", false);
+        lidar_quality.config.min_points = this->declare_parameter<int>("lidar_quality.min_points", 30);
+        lidar_quality.config.min_ratio = this->declare_parameter<double>("lidar_quality.min_ratio", .10);
+        lidar_quality.config.max_residual = this->declare_parameter<double>("lidar_quality.max_residual", .15);
+        lidar_quality.config.weak_geometry_ratio = this->declare_parameter<double>("lidar_quality.weak_geometry_ratio", .003);
+        lidar_quality.config.degraded_weight = this->declare_parameter<double>("lidar_quality.degraded_weight", .20);
+        lidar_quality.config.recovery_scans = this->declare_parameter<int>("lidar_quality.recovery_scans", 10);
+        lidar_quality.config.max_position_correction = this->declare_parameter<double>("lidar_quality.max_position_correction", .50);
+        lidar_quality.config.max_rotation_correction = this->declare_parameter<double>("lidar_quality.max_rotation_correction", .15);
+        lidar_quality.config.validate();
         wheel_config.velocity_std = this->declare_parameter<double>("wheel.velocity_std", 0.05);
         wheel_config.yaw_rate_std = this->declare_parameter<double>("wheel.yaw_rate_std", 0.05);
         const auto wheel_t = this->declare_parameter<vector<double>>("wheel.imu_to_base_translation", {0.0, 0.0, 0.0});
@@ -1094,7 +1124,8 @@ private:
             {
                 diagnostic_scan.outcome = diagnostic_initializing ? "imu_initialization" : "no_points";
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
-                return;
+                if (diagnostic_initializing || !lidar_quality.config.enabled || ikdtree.Root_Node == nullptr)
+                    return;
             }
 
             flg_EKF_inited = (Measures.lidar_beg_time - first_lidar_time) < INIT_TIME ? \
@@ -1103,8 +1134,11 @@ private:
             lasermap_fov_segment();
 
             /*** downsample the feature points in a scan ***/
-            downSizeFilterSurf.setInputCloud(feats_undistort);
-            downSizeFilterSurf.filter(*feats_down_body);
+            feats_down_body->clear();
+            if (feats_undistort && !feats_undistort->empty()) {
+                downSizeFilterSurf.setInputCloud(feats_undistort);
+                downSizeFilterSurf.filter(*feats_down_body);
+            }
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
             /*** initialize the map kdtree ***/
@@ -1130,7 +1164,7 @@ private:
             // cout<<"[ mapping ]: In num: "<<feats_undistort->points.size()<<" downsamp "<<feats_down_size<<" Map num: "<<featsFromMapNum<<"effect num:"<<effct_feat_num<<endl;
 
             /*** ICP and iterated Kalman filter update ***/
-            if (feats_down_size < 5)
+            if (feats_down_size < 5 && !lidar_quality.config.enabled)
             {
                 RCLCPP_WARN(this->get_logger(), "No point, skip this scan!\n");
                 return;
@@ -1182,9 +1216,49 @@ private:
                     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                         "Wheel fusion inactive: no fresh wheel/IMU data for scan");
             }
+            state_ikfom predicted_state = kf.get_x();
+            auto predicted_covariance = kf.get_P();
+            lidar_quality.begin_scan();
             kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+            if (lidar_quality.config.enabled) {
+                const state_ikfom candidate = kf.get_x();
+                const double correction_position = (candidate.pos-predicted_state.pos).norm();
+                const double correction_rotation = Eigen::AngleAxisd(
+                    predicted_state.rot.toRotationMatrix().transpose()*candidate.rot.toRotationMatrix()).angle();
+                const bool valid_correction = lidar_quality.correction_valid(correction_position, correction_rotation);
+                if (!valid_correction || !kf.get_P().allFinite()) {
+                    if (!kf.get_P().allFinite()) lidar_quality.reject("nonfinite_covariance");
+                    kf.change_x(predicted_state);
+                    kf.change_P(predicted_covariance);
+                    // Re-run with just fresh wheel observations, never a second
+                    // LiDAR attempt or an unaligned external EKF pose.
+                    if (wheel_available) kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
+                    if (!kf.get_x().pos.allFinite() || !kf.get_x().vel.allFinite() || !kf.get_P().allFinite()) {
+                        kf.change_x(predicted_state);
+                        kf.change_P(predicted_covariance);
+                        lidar_quality.reject("invalid_wheel_update");
+                    }
+                }
+                lidar_quality.finish_scan();
+                if (!lidar_quality.allow_map_update())
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                        "LiDAR quality %s (%s): weight=%.2f, map frozen, wheel=%s",
+                        lidar_quality.mode_name(), lidar_quality.reason.c_str(), lidar_quality.weight,
+                        wheel_available ? "fresh" : "unavailable");
+            }
+            pipeline_diagnostics.lidar_health_json = lidar_quality.json(wheel_available);
             state_point = kf.get_x();
             euler_cur = SO3ToEuler(state_point.rot);
+            pipeline_diagnostics.state("z_m", state_point.pos.z());
+            pipeline_diagnostics.state("roll_deg", euler_cur.x());
+            pipeline_diagnostics.state("pitch_deg", euler_cur.y());
+            pipeline_diagnostics.state("effective_lidar_points", effct_feat_num);
+            for (int axis = 0; axis < 3; ++axis) {
+                const string suffix = axis == 0 ? "x" : axis == 1 ? "y" : "z";
+                pipeline_diagnostics.state("gyro_bias_" + suffix + "_rad_s", state_point.bg[axis]);
+                pipeline_diagnostics.state("accel_bias_" + suffix + "_m_s2", state_point.ba[axis]);
+                pipeline_diagnostics.state("gravity_" + suffix + "_m_s2", state_point.grav[axis]);
+            }
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
             geoQuat.y = state_point.rot.coeffs()[1];
@@ -1202,7 +1276,15 @@ private:
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
             const auto diagnostic_map_start = fast_lio::PipelineDiagnostics::Clock::now();
-            map_incremental();
+            if (lidar_quality.allow_map_update()) {
+                map_incremental();
+                pipeline_diagnostics.count("map_updates_applied");
+            } else {
+                add_point_size = 0;
+                pipeline_diagnostics.count("map_updates_frozen");
+            }
+            pipeline_diagnostics.state("map_points_added", add_point_size);
+            pipeline_diagnostics.state("map_tree_points", ikdtree.validnum());
             pipeline_diagnostics.measure("map_update_ms", fast_lio::PipelineDiagnostics::ms(
                 fast_lio::PipelineDiagnostics::Clock::now(), diagnostic_map_start));
             t5 = omp_get_wtime();

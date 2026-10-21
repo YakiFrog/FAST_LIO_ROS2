@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <algorithm>
+#include <cmath>
 
 namespace fast_lio {
 class PipelineDiagnostics {
@@ -21,6 +22,8 @@ class PipelineDiagnostics {
   bool enabled = false;
   std::map<std::string, unsigned long> counters;
   std::map<std::string, Metric> timings;
+  std::map<std::string, double> estimator_state;
+  std::string lidar_health_json = "null";
   struct Scan { const void* id; Time receipt, enqueued; };
   std::deque<Scan> queue;
   Scan active{nullptr, {}, {}};
@@ -31,6 +34,7 @@ class PipelineDiagnostics {
 
   void count(const std::string& key) { if (enabled) ++counters[key]; }
   void measure(const std::string& key, double value) { if (enabled) timings[key].add(value); }
+  void state(const std::string& key, double value) { if (enabled) estimator_state[key] = value; }
   void enqueue(const void* id, Time receipt) {
     if (!enabled) return;
     const auto now = Clock::now();
@@ -91,7 +95,16 @@ class PipelineDiagnostics {
       out << '"' << item.first << "\":{\"count\":" << m.count << ",\"mean\":" << m.sum/m.count
           << ",\"max\":" << m.maximum << ",\"last\":" << m.last << '}';
     }
-    out << "}}";
+    out << "},\"estimator_state\":{";
+    first = true;
+    for (const auto& item : estimator_state) {
+      if (!first) out << ',';
+      first = false;
+      out << '"' << item.first << "\":";
+      if (std::isfinite(item.second)) out << item.second;
+      else out << "null";
+    }
+    out << "},\"lidar_health\":" << lidar_health_json << '}';
     return out.str();
   }
   struct Scope {
